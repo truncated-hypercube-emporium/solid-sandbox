@@ -1,0 +1,41 @@
+# XcodeGen spec: `xcodegen generate` in this folder makes SolidSandbox.xcodeproj.
+name: SolidSandbox
+options:
+  bundleIdPrefix: com.platomon
+  deploymentTarget:
+    iOS: "14.0"
+settings:
+  base:
+    MARKETING_VERSION: "2.1.0"
+    CURRENT_PROJECT_VERSION: "20100"
+targets:
+  SolidSandbox:
+    type: application
+    platform: iOS
+    sources:
+      - path: SolidSandbox
+        excludes: ["Info.plist"]
+      - path: include
+        buildPhase: none
+    info:
+      path: SolidSandbox/Info.plist
+    settings:
+      base:
+        PRODUCT_NAME: SolidSandbox
+        PRODUCT_BUNDLE_IDENTIFIER: com.platomon.sandbox
+        TARGETED_DEVICE_FAMILY: "1,2"
+        CLANG_ENABLE_OBJC_ARC: YES
+        HEADER_SEARCH_PATHS: $(SRCROOT)/include
+        # the Rust core, built by build-rust.sh for the platform being built
+        LIBRARY_SEARCH_PATHS: $(SRCROOT)/../target/ios-$(PLATFORM_NAME)
+        OTHER_LDFLAGS: -lsolid_sandbox
+        # set your team here, or in Xcode's Signing & Capabilities
+        DEVELOPMENT_TEAM: ""
+        CODE_SIGN_STYLE: Automatic
+    dependencies:
+      - sdk: CoreMotion.framework
+      - sdk: QuartzCore.framework
+    preBuildScripts:
+      - name: Build Rust core
+        script: '"$SRCROOT/build-rust.sh"'
+        basedOnDependencyAnalysis: false

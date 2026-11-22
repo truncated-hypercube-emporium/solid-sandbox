@@ -1,4 +1,5 @@
-//! Solid Sandbox for Android 4.4+ (NativeActivity, no Java code).
+//! Solid Sandbox for Android 4.4+ (NativeActivity, no Java code) and iOS 14+
+//! (a static library driven by the UIKit shell in `ios/`).
 //!
 //! A random number of platomon's path-traced solids bounce around a cube
 //! about 10 solid radii on a side. Each solid has its own colour gradient and
@@ -16,11 +17,14 @@
 mod compat;
 #[path = "../android/src/font.rs"]
 mod font;
+pub mod app;
+#[cfg(any(target_os = "ios", test))]
+pub mod ios;
 pub mod palette;
 pub mod physics;
 pub mod sandbox;
 pub mod settings;
-mod ui;
+pub mod ui;
 
 use font::{CELL_H, CELL_W, Font, GLYPH_W};
 
@@ -121,15 +125,11 @@ fn draw_row(px: &mut [u32], stride: usize, g: &Grid, font: &Font, row: usize, ce
 /// and the sandbox are plain Rust and tested on the host).
 #[cfg(target_os = "android")]
 pub mod native {
-    use super::*;
     use std::ffi::{CString, c_char, c_void};
     use std::sync::{Arc, Condvar, Mutex};
     use std::time::{Duration, Instant};
 
-    use crate::palette::Palettes;
-    use crate::sandbox::{self, Sandbox};
-    use crate::settings::Settings;
-    use crate::ui::{Canvas, Tap, Ui};
+    use crate::app::App;
 
     #[repr(C)]
     pub struct ANativeActivityCallbacks {
@@ -724,49 +724,13 @@ pub mod native {
             unsafe { (ANativeWindow_getWidth(win), ANativeWindow_getHeight(win)) }
         };
 
-        let seed = || std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(7, |t| t.as_nanos() as u64);
         // SAFETY: the activity outlives this thread (on_destroy joins it);
         // internalDataPath is a NUL-terminated string Android owns.
         let data_dir = unsafe {
             let p = (*(sh.activity as *const ANativeActivity)).internalDataPath;
             (!p.is_null()).then(|| std::path::PathBuf::from(std::ffi::CStr::from_ptr(p).to_string_lossy().into_owned()))
         };
-        let settings_file = data_dir.as_ref().map(|d| d.join("settings.txt"));
-        let settings = settings_file
-            .as_ref()
-            .and_then(|f| std::fs::read_to_string(f).ok())
-            .map_or_else(Settings::default, |t| Settings::from_text(&t));
-        // the palettes last between sessions: made once, then only when the
-        // palette button is pressed
-        let palette_file = data_dir.map(|d| d.join("palettes.txt"));
-        let save_palettes = |p: &Palettes| {
-            if let Some(f) = &palette_file
-                && let Err(e) = std::fs::write(f, p.to_text())
-            {
-                log(&format!("saving palettes failed: {e}"));
-            }
-        };
-        let mut palettes = match palette_file.as_ref().and_then(|f| std::fs::read_to_string(f).ok()).and_then(|t| Palettes::from_text(&t)) {
-            Some(p) => p,
-            None => {
-                let p = Palettes::generate(seed());
-                save_palettes(&p);
-                log("made new palettes");
-                p
-            }
-        };
-
-        let mut sb = Sandbox::with_settings(seed(), &settings);
-        sb.set_live(&settings, Some(&palettes));
-        let rs = sandbox::render_settings(CELL_W as f32 / CELL_H as f32);
-        let spc = sandbox::seconds_per_cell(&mut sb, &rs);
-        let mut base_scale = scale_for(w, h, spc);
-        let mut scale = char_scale(base_scale, settings.char_scale());
-        log(&format!("{w}x{h}, {} solids in a {:?}, {:.2} us/cell -> scale {scale}", sb.world.bodies.len(), sb.world.shape, spc * 1e6));
-
-        let font = Font::default();
-        let mut grid = Grid::new(w, h, scale);
-        let mut ui = Ui::new(w, h, settings);
+        let mut app = App::new(w, h, data_dir, log);
         let mut taps: Vec<(f32, f32)> = Vec::new();
         let mut backs = 0u32;
         let mut last = Instant::now();
@@ -780,7 +744,7 @@ pub mod native {
             // taps accumulate across the idle passes until the next frame applies them
             poll_input(sh, &mut taps, &mut backs, &mut accel);
             for _ in 0..std::mem::take(&mut backs) {
-                if !ui.back() {
+                if !app.back() {
                     // SAFETY: the activity is live while this thread runs.
                     unsafe { ANativeActivity_finish(sh.activity as *mut ANativeActivity) };
                 }
@@ -798,8 +762,8 @@ pub mod native {
                     continue;
                 }
             }
-            // the Performance page's frame-rate cap
-            let period = Duration::from_secs_f32(1.0 / ui.current.fps());
+            // the frame-rate cap
+            let period = Duration::from_secs_f32(1.0 / app.fps());
             let now = Instant::now();
             if now < last + period {
                 std::thread::sleep((last + period - now).min(Duration::from_millis(8)));
@@ -807,46 +771,10 @@ pub mod native {
             }
             let dt = (now - last).as_secs_f32();
             last = now;
-            ui.tick(dt);
-
             for (x, y) in taps.drain(..) {
-                let before = ui.current;
-                match ui.tap(x, y) {
-                    Tap::Scene => {
-                        let (gx, gy) = grid.to_grid(x, y);
-                        let hit = sb.tap(gx, gy);
-                        log(&format!("tap {x:.0},{y:.0} -> {}", hit.map_or("miss".to_string(), |i| format!("solid {i}"))));
-                    }
-                    Tap::Ui => log(&format!("tap {x:.0},{y:.0} -> ui")),
-                    Tap::NewPalettes => {
-                        palettes = Palettes::generate(seed());
-                        save_palettes(&palettes);
-                        // the scene picks up the new colours straight away
-                        sb.set_live(&ui.current, Some(&palettes));
-                        log("new palettes");
-                    }
-                    Tap::Apply(s) => {
-                        if let Some(f) = &settings_file
-                            && let Err(e) = std::fs::write(f, s.to_text())
-                        {
-                            log(&format!("saving settings failed: {e}"));
-                        }
-                        if !s.same_scene(&before) {
-                            sb = Sandbox::with_settings(seed(), &s);
-                        }
-                        // colours, explosions and performance apply to the running scene
-                        sb.set_live(&s, Some(&palettes));
-                        let new_scale = char_scale(base_scale, s.char_scale());
-                        if new_scale != scale {
-                            scale = new_scale;
-                            grid = Grid::new(grid.w, grid.h, scale);
-                            log(&format!("character scale {} -> scale {scale}", s.char_scale()));
-                        }
-                        log(&format!("applied: {}", s.to_text().replace('\n', " ")));
-                    }
-                }
+                app.tap(x, y);
             }
-            let gravity_on = ui.current.gravity() > 0.0;
+            let gravity_on = app.wants_accel();
             accel.set_enabled(gravity_on);
             if gravity_on {
                 accel.drain();
@@ -860,9 +788,7 @@ pub mod native {
                     }
                 }
             }
-            sb.set_accel(accel.latest.map(|a| (a, rot)));
-            sb.step(dt);
-            sb.render(grid.cols, grid.rows, &rs);
+            app.step(dt, accel.latest.map(|a| (a, rot)));
 
             let mut st = sh.state.lock().unwrap_or_else(|e| e.into_inner());
             if st.window == 0 {
@@ -876,13 +802,9 @@ pub mod native {
                     st.window_changed = false;
                     ANativeWindow_setBuffersGeometry(win, 0, 0, WINDOW_FORMAT_RGBX_8888);
                     let (nw, nh) = (ANativeWindow_getWidth(win), ANativeWindow_getHeight(win));
-                    if (nw, nh) != (grid.w, grid.h) {
+                    if (nw, nh) != app.size() {
                         // the first window can be a placeholder size: re-fit the cells
-                        base_scale = scale_for(nw, nh, spc);
-                        scale = char_scale(base_scale, ui.current.char_scale());
-                        log(&format!("window {nw}x{nh} -> scale {scale}"));
-                        grid = Grid::new(nw, nh, scale);
-                        ui.resize(nw, nh);
+                        app.resize(nw, nh);
                         continue; // next frame renders at the new grid size
                     }
                 }
@@ -899,15 +821,7 @@ pub mod native {
                 }
                 let stride = buf.stride.max(buf.width) as usize;
                 let px = std::slice::from_raw_parts_mut(buf.bits as *mut u32, stride * buf.height.max(0) as usize);
-                px.fill(0xFF00_0000);
-                if buf.width >= grid.w && buf.height >= grid.h && sb.chars.len() == grid.cols * grid.rows {
-                    for row in 0..grid.rows {
-                        let r = row * grid.cols..(row + 1) * grid.cols;
-                        draw_row(px, stride, &grid, &font, row, &sb.chars[r.clone()], &sb.colors[r]);
-                    }
-                }
-                let (cw, chh) = (grid.w.min(buf.width), grid.h.min(buf.height));
-                ui.draw(&mut Canvas { px, stride, w: cw, h: chh }, &font, &sb.stats());
+                app.draw(px, stride, buf.width, buf.height);
                 ANativeWindow_unlockAndPost(win);
             }
         }
