@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Solid Sandbox for Android 4.4+: a NativeActivity with no Java code and no permissions. -->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="com.platomon.sandbox"
+    android:versionCode="20100"
+    android:versionName="2.1.0">
+
+    <uses-sdk android:minSdkVersion="19" android:targetSdkVersion="19" />
+
+    <application
+        android:label="Solid Sandbox"
+        android:icon="@drawable/icon"
+        android:hasCode="false"
+        android:allowBackup="false">
+
+        <activity
+            android:name="android.app.NativeActivity"
+            android:label="Solid Sandbox"
+            android:theme="@android:style/Theme.NoTitleBar.Fullscreen"
+            android:screenOrientation="sensorLandscape"
+            android:configChanges="orientation|keyboardHidden|screenSize"
+            android:launchMode="singleTask">
+            <meta-data android:name="android.app.lib_name" android:value="solid_sandbox" />
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+    </application>
+</manifest>

@@ -1,0 +1,47 @@
+[package]
+name = "platomon"
+version = "1.3.0"
+edition = "2024"
+description = "Platonic-solid ASCII system monitor: five path-traced solids, one per resource"
+license = "MIT OR Apache-2.0"
+
+[features]
+default = ["nvidia"]
+# System monitoring (sysinfo collector, metrics, config, stats bar). The
+# physics sandbox builds without it.
+monitor = ["dep:sysinfo"]
+nvidia = ["monitor", "dep:nvml-wrapper"]
+
+[dependencies]
+clap = { version = "4.6.8", features = ["derive"] }
+crossterm = "0.29.0"
+dirs = "7.0.0"
+fastrand = "2.5.0"
+glam = "0.34.3"
+nvml-wrapper = { version = "0.13.0", optional = true }
+rayon = "1.12.0"
+serde = { version = "1.0.229", features = ["derive"] }
+sysinfo = { version = "0.40.4", optional = true, default-features = false, features = ["system", "disk", "network", "gpu"] }
+toml = "1.2.1"
+
+[[bin]]
+name = "platomon"
+path = "src/main.rs"
+required-features = ["monitor"]
+
+[dev-dependencies]
+criterion = "0.8.2"
+
+[[bench]]
+name = "render"
+harness = false
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+
+[profile.bench]
+opt-level = 3
+lto = "thin"
+codegen-units = 1

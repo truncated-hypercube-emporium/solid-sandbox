@@ -1,0 +1,28 @@
+[package]
+name = "solid-sandbox"
+version = "2.1.0"
+edition = "2024"
+description = "Physics sandbox of platomon's path-traced solids, for Android 4.4+ (NativeActivity)"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[lib]
+name = "solid_sandbox"
+crate-type = ["cdylib", "rlib"]
+path = "src/lib.rs"
+
+[dependencies]
+# No `monitor` feature: no system collector, metrics, config or stats bar.
+platomon = { path = "platomon", default-features = false }
+fastrand = "2.5.0"
+glam = "0.34.3"
+
+[dev-dependencies]
+# examples/terminal.rs: run the sandbox in a terminal on the desktop
+crossterm = "0.29.0"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = true
