@@ -9,15 +9,25 @@ Features: sphere or exact face/corner collisions, gravity from the
 accelerometer, mass variability, elasticity and damping with drag, collision
 damage counters, weak and strong (spin-driven shock wave) explosions with
 flying faces and sparks, four glow levels with white or inherited glow,
-generated 3- to 6-bit palettes, a dynamic camera, and live stats.
+generated 2- to 6-bit palettes, saturation down to luminosity only, a
+dynamic camera, and live stats.
+
+Two shaders: **Raymarch** path-traces the solids' SDFs (one bounce, soft
+shadows); **Optimized** rasterizes their faces, lights each face once per
+frame through a tone-map lookup table and ordered-dithers it between two
+glyph levels, about 7× faster than the raymarch shader on all cores and 30×
+on one. With the optimized shader, **Ambient light** darkens faces turned
+towards nearby solids, from the distance between their centres.
+`cargo run --release --example bench_shading` measures both.
 
 The three buttons top right (hidden until you tap the screen) open
-**Settings**, **Simulation Parameters** and **Colour**.
+**Game Settings**, **Simulation Parameters** and **Rendering Options**.
 
 ## Layout
 
-- `src/` — the sandbox: `physics.rs`, `sandbox.rs` (rendering), `ui.rs`,
-  `settings.rs`, `palette.rs`, and `lib.rs` (the NativeActivity glue)
+- `src/` — the sandbox: `physics.rs`, `sandbox.rs` (rendering), `shade.rs`
+  (the optimized shader and ambient light), `ui.rs`, `settings.rs`,
+  `palette.rs`, and `lib.rs` (the NativeActivity glue)
 - `android/` — shared Android helpers: bitmap font, API-19 compatibility
   shims, toolchain environment and the API-level symbol check
 - `platomon/` — the platomon path-tracing library the scene is rendered with
@@ -27,6 +37,7 @@ The three buttons top right (hidden until you tap the screen) open
 - `ios/` — the iOS shell: Objective-C UIKit view (`SolidSandbox/main.m`),
   the C header, an XcodeGen project and the Rust build script
 - `examples/terminal.rs` — run the sandbox in a desktop terminal
+- `examples/bench_shading.rs` — time each shader and ambient-light option
 
 ## Building
 

@@ -5,6 +5,7 @@ use glam::{Quat, Vec3, Vec3A};
 use platomon::ascii::{Ramp, tone_map};
 use platomon::color::Gradient;
 use platomon::render::{NO_HIT, Projection, RenderSettings, Renderer, TraceSettings};
+use rayon::prelude::*;
 use platomon::scene::sdf::SolidKind;
 #[cfg(test)]
 use platomon::scene::sdf::inverse_rotation;
@@ -13,8 +14,9 @@ use platomon::scene::{AnimParams, Camera, CameraParams, GroundParams, Layout, Li
 use std::f32::consts::TAU;
 
 use crate::palette::{Palettes, Quantizer, bit_shift_24, saturate};
+use crate::shade::{self, FaceShade, NO_FACE, Raster, ToneLut, bayer};
 use crate::physics::{self, World};
-use crate::settings::{ColourBy, Explosions, Glow, Settings, WireColour};
+use crate::settings::{ColourBy, Explosions, Glow, Settings, Shader, WireColour};
 #[cfg(test)]
 use crate::physics::TAP_SPEED;
 
@@ -40,12 +42,6 @@ const GLOW_SHADING: f32 = 0.65;
 pub const GLOW_SHADE_DARKEN: f32 = 0.5;
 /// White glow keeps this share of a lit solid's chroma at full light.
 pub const WHITE_GLOW_CHROMA: f32 = 0.5;
-
-/// 4×4 ordered-dither threshold for cell (`x`, `y`), in (0, 1).
-fn bayer(x: usize, y: usize) -> f32 {
-    const M: [[u8; 4]; 4] = [[0, 8, 2, 10], [12, 4, 14, 6], [3, 11, 1, 9], [15, 7, 13, 5]];
-    (M[y % 4][x % 4] as f32 + 0.5) / 16.0
-}
 
 /// `c` with its chroma scaled by `k`: each channel moved towards its luma.
 fn chroma(c: u32, k: f32) -> u32 {
@@ -353,6 +349,28 @@ fn trace_segment(
     }
 }
 
+/// Raymarch ambient light: short rays cast off each surface cell (see
+/// `examples/bench_shading.rs` for what each costs).
+pub const AO_RAYS: usize = 2;
+
+/// Raymarch ambient light: darken each solid cell of `lums` by how
+/// occluded its surface is, from `rays` short rays turned by the cell's
+/// dither threshold. Rows run in parallel.
+fn ray_ambient(scene: &Scene, proj: &Projection, cols: usize, depth: &[f32], ids: &[u8], rays: usize, lums: &mut [f32]) {
+    let n = scene.solids.len();
+    let eye = proj.cam.pos;
+    lums.par_chunks_mut(cols.max(1)).enumerate().for_each(|(y, row)| {
+        for (x, lum) in row.iter_mut().enumerate() {
+            let k = y * cols + x;
+            if (ids[k] as usize) < n {
+                let p = eye + proj.ray(x as f32 + 0.5, y as f32 + 0.5) * depth[k];
+                let occ = shade::ray_occlusion(scene, ids[k], p, rays, TAU * bayer(x, y));
+                *lum *= 1.0 - shade::AMBIENT_STRENGTH * occ;
+            }
+        }
+    });
+}
+
 pub fn render_settings(char_aspect: f32) -> RenderSettings {
     RenderSettings {
         spp: 1,
@@ -383,8 +401,20 @@ pub struct Sandbox {
     pub colour_by: ColourBy,
     /// Saturation scale for the solids' colours (1: as designed).
     pub saturation: f32,
-    /// Nearest-colour lookup for the palette in use, if any.
+    /// Nearest-colour lookup for the palette in use, if any (in greys when
+    /// saturation is off).
     quantizer: Option<Quantizer>,
+    /// How the solids are shaded, and whether they darken each other where
+    /// close (ambient light).
+    pub shader: Shader,
+    pub ambient: bool,
+    /// Raymarch ambient light: short rays cast off each surface cell.
+    pub ao_rays: usize,
+    /// The optimized shader's G-buffer, its faces' shading this frame, and
+    /// its tone-map table.
+    raster: Raster,
+    face_shades: Vec<FaceShade>,
+    tone_lut: ToneLut,
     /// Cells showing a solid, its glow or its fragments: the ones the
     /// saturation and palette apply to.
     tinted: Vec<bool>,
@@ -489,6 +519,12 @@ impl Sandbox {
             colour_by: settings.colour_by(),
             saturation: settings.saturation(),
             quantizer: None,
+            shader: settings.shader(),
+            ambient: settings.ambient(),
+            ao_rays: AO_RAYS,
+            raster: Raster::default(),
+            face_shades: Vec::new(),
+            tone_lut: ToneLut::new(EXPOSURE),
             tinted: Vec::new(),
             wire_colour: settings.wire_colour(),
             under: Vec::new(),
@@ -537,12 +573,18 @@ impl Sandbox {
         self.white_glow = settings.white_glow();
         self.wire_colour = settings.wire_colour();
         self.world.charge = settings.charge();
+        self.shader = settings.shader();
+        self.ambient = settings.ambient();
         self.set_palette(settings.palette().and_then(|i| palettes?.get(i)));
     }
 
     /// Draw the solids in this palette's colours, or `None` for their own.
+    /// With saturation off the palette is collapsed to its colours'
+    /// luminosities (set the saturation first).
     pub fn set_palette(&mut self, palette: Option<&[u32]>) {
-        self.quantizer = palette.map(Quantizer::new);
+        self.quantizer = palette.map(|p| {
+            if self.saturation == 0.0 { Quantizer::new(&p.iter().map(|&c| saturate(c, 0.0)).collect::<Vec<_>>()) } else { Quantizer::new(p) }
+        });
     }
 
     /// Whether a palette is in use.
@@ -778,32 +820,40 @@ impl Sandbox {
 
     /// Render a `cols Ã— rows` frame into `chars` / `colors` (`0xRRGGBB`).
     pub fn render(&mut self, cols: usize, rows: usize, rs: &RenderSettings) {
-        self.renderer.render(&self.scene, cols, rows, rs);
-        let Some(view) = self.renderer.view() else { return };
-        self.proj = Some(view.proj);
         let n = self.world.bodies.len();
         // the colour mode picks the gradient position; wires always follow speed
         let t: Vec<f32> = (0..n).map(|i| self.colour_t(i)).collect();
         let speeds: Vec<f32> = (0..n).map(|i| self.speed_t(i)).collect();
         self.chars.clear();
         self.colors.clear();
+        let (lums, depth, ids, proj) = match self.shader {
+            Shader::Raymarch => {
+                self.renderer.render(&self.scene, cols, rows, rs);
+                let Some(view) = self.renderer.view() else { return };
+                let mut lums: Vec<f32> = view.radiance.iter().map(|&rad| tone_map(rad, EXPOSURE)).collect();
+                if self.ambient && self.glow != Glow::Off {
+                    ray_ambient(&self.scene, &view.proj, cols, view.depth, view.ids, self.ao_rays, &mut lums);
+                }
+                for (k, &lum) in lums.iter().enumerate() {
+                    let id = view.ids[k] as usize;
+                    if id < n {
+                        let g = self.ramp.glyph(lum);
+                        self.chars.push(if g == ' ' { '.' } else { g });
+                        self.colors.push(self.gradients[id].sample(t[id], 0.4 + 0.6 * lum));
+                    } else {
+                        self.chars.push(self.ramp.glyph(lum));
+                        self.colors.push(0xff_ff_ff);
+                    }
+                }
+                (lums, view.depth.to_vec(), view.ids.to_vec(), view.proj)
+            }
+            Shader::Optimized => self.rasterize(cols, rows, rs, &t),
+        };
+        self.proj = Some(proj);
         self.tinted.clear();
-        self.tinted.extend(view.ids.iter().map(|&id| (id as usize) < n));
+        self.tinted.extend(ids.iter().map(|&id| (id as usize) < n));
         self.under.clear();
         self.under.resize(cols * rows, (NO_WIRE, false, 1.0));
-        let lums: Vec<f32> = view.radiance.iter().map(|&rad| tone_map(rad, EXPOSURE)).collect();
-        for (k, &lum) in lums.iter().enumerate() {
-            let id = view.ids[k] as usize;
-            if id < n {
-                let g = self.ramp.glyph(lum);
-                self.chars.push(if g == ' ' { '.' } else { g });
-                self.colors.push(self.gradients[id].sample(t[id], 0.4 + 0.6 * lum));
-            } else {
-                self.chars.push(self.ramp.glyph(lum));
-                self.colors.push(0xff_ff_ff);
-            }
-        }
-        let (depth, ids, proj) = (view.depth.to_vec(), view.ids.to_vec(), view.proj);
         let emitters = self.emitters(&t);
         if !emitters.is_empty() {
             self.draw_glow(cols, &proj, &depth, &ids, &lums, &emitters);
@@ -842,6 +892,70 @@ impl Sandbox {
                 self.colors[k] = if fade < 1.0 && self.wire_colour != WireColour::Velocity { dim(c, fade) } else { c };
             }
         }
+    }
+
+    /// The optimized shader: every live solid's front faces rasterized into
+    /// the grid, each lit once (by the scene's light, a fill for the bounce
+    /// light, and with ambient light on, darkened by the solids in front of
+    /// it) and dithered between two glyph levels. Fills `chars` and
+    /// `colors`, and returns the luminosity, depth, solid ids and
+    /// projection, as the path tracer's G-buffer gives them.
+    fn rasterize(&mut self, cols: usize, rows: usize, rs: &RenderSettings, t: &[f32]) -> (Vec<f32>, Vec<f32>, Vec<u8>, Projection) {
+        let proj = Projection::new(self.scene.camera, cols, rows, rs);
+        let eye = proj.cam.pos;
+        let light = self.scene.light.center;
+        self.raster.clear(cols * rows);
+        self.face_shades.clear();
+        let live = |i: usize| self.world.bodies[i].alive;
+        let occluders: Vec<(usize, Vec3A, f32)> =
+            self.scene.solids.iter().enumerate().filter(|&(i, _)| live(i)).map(|(i, s)| (i, s.center, s.scale * shade::OCCLUDER_SCALE)).collect();
+        let mut pts: Vec<(f32, f32)> = Vec::with_capacity(12);
+        for (i, inst) in self.scene.solids.iter().enumerate().filter(|&(i, _)| live(i)) {
+            let rot = inst.inv_rot.transpose();
+            let direct = shade::direct_scale(&self.scene, inst.center, inst.albedo);
+            let (grad, ti) = (&self.gradients[i], t[i]);
+            for (local_n, ring) in &self.faces[i] {
+                let n = rot * *local_n;
+                let p0 = inst.center + rot * (ring[0] * inst.scale);
+                if n.dot(eye - p0) <= 0.0 {
+                    continue; // facing away
+                }
+                pts.clear();
+                let mut centre = Vec3A::ZERO;
+                for &v in ring {
+                    let w = inst.center + rot * (v * inst.scale);
+                    centre += w;
+                    pts.extend(proj.project(w));
+                }
+                if pts.len() != ring.len() {
+                    continue; // reaches behind the camera
+                }
+                centre /= ring.len() as f32;
+                let mut rad = direct * n.dot((light - centre).normalize()).max(0.0) + shade::FILL;
+                if self.ambient {
+                    let near = occluders.iter().filter(|o| o.0 != i).map(|o| (o.1, o.2));
+                    let occ = (shade::AMBIENT_GAIN * shade::sphere_occlusion(centre, n, near)).min(1.0);
+                    rad *= 1.0 - shade::AMBIENT_STRENGTH * occ;
+                }
+                let face = self.face_shades.len() as u32;
+                self.face_shades.push(FaceShade::new(self.tone_lut.get(rad), &self.ramp, |b| grad.sample(ti, 0.4 + 0.6 * b)));
+                self.raster.fill(&proj, (cols, rows), &pts, p0, n, i as u8, face);
+            }
+        }
+        let mut lums = vec![0.0; cols * rows];
+        for (k, &f) in self.raster.face.iter().enumerate() {
+            if f == NO_FACE {
+                self.chars.push(' ');
+                self.colors.push(0xff_ff_ff);
+            } else {
+                let s = &self.face_shades[f as usize];
+                let (g, c) = s.at(k % cols, k / cols);
+                self.chars.push(g);
+                self.colors.push(c);
+                lums[k] = s.lum;
+            }
+        }
+        (lums, self.raster.depth.clone(), self.raster.ids.clone(), proj)
     }
 
     /// The flying faces, filled and shaded by the scene's light, each fading
@@ -1206,7 +1320,7 @@ mod tests {
 
     #[test]
     fn settings_fix_container_count_wires_and_tap_speed() {
-        let s = Settings { pick: [3, 3, 1, 2, 0, 0, 0, 2, 0, 0, 0, 0, 1, 1, 0, 1, 0, 4, 2, 1, 1, 0, 0] }; // dodecahedron, 6 solids, no wires, fast
+        let s = Settings { pick: [3, 3, 1, 2, 0, 0, 0, 2, 0, 0, 0, 0, 2, 1, 0, 1, 0, 4, 2, 1, 1, 0, 0, 0, 0] }; // dodecahedron, 6 solids, no wires, fast
         for seed in 0..5 {
             let mut sb = full(Sandbox::with_settings(seed, &s));
             assert_eq!(sb.world.shape, platomon::scene::sdf::SolidKind::Dodecahedron);
@@ -1238,7 +1352,7 @@ mod tests {
 
     #[test]
     fn gravity_points_where_the_screen_says() {
-        let mut sb = full(Sandbox::with_settings(3, &Settings { pick: [1, 1, 0, 1, 2, 0, 0, 2, 0, 0, 0, 0, 1, 1, 0, 1, 0, 4, 2, 1, 1, 0, 0] }));
+        let mut sb = full(Sandbox::with_settings(3, &Settings { pick: [1, 1, 0, 1, 2, 0, 0, 2, 0, 0, 0, 0, 2, 1, 0, 1, 0, 4, 2, 1, 1, 0, 0, 0, 0] }));
         sb.render(160, 60, &render_settings(0.75));
         let p = sb.proj.unwrap();
         let c = sb.world.centre();
@@ -1291,7 +1405,7 @@ mod tests {
             assert!((sb.scene.solids[i].inv_rot - m).abs_diff_eq(Mat3A::ZERO, 1e-4));
         }
         // exact mode: the solids tumble freely and the scene follows
-        let mut sb = full(Sandbox::with_settings(6, &Settings { pick: [2, 8, 0, 1, 0, 1, 0, 2, 0, 0, 0, 0, 1, 1, 0, 1, 0, 4, 2, 1, 1, 0, 0] }));
+        let mut sb = full(Sandbox::with_settings(6, &Settings { pick: [2, 8, 0, 1, 0, 1, 0, 2, 0, 0, 0, 0, 2, 1, 0, 1, 0, 4, 2, 1, 1, 0, 0, 0, 0] }));
         assert!(sb.world.is_exact());
         let mut rng = fastrand::Rng::with_seed(2);
         for i in 0..sb.world.bodies.len() {
@@ -1312,7 +1426,7 @@ mod tests {
     #[test]
     fn settings_reach_the_physics() {
         // high mass variability, no elasticity, high damping
-        let sb = full(Sandbox::with_settings(4, &Settings { pick: [1, 9, 0, 1, 0, 0, 3, 0, 3, 0, 0, 0, 1, 1, 0, 1, 0, 4, 2, 1, 1, 0, 0] }));
+        let sb = full(Sandbox::with_settings(4, &Settings { pick: [1, 9, 0, 1, 0, 0, 3, 0, 3, 0, 0, 0, 2, 1, 0, 1, 0, 4, 2, 1, 1, 0, 0, 0, 0] }));
         let m: Vec<f32> = sb.world.bodies.iter().map(|b| b.mass).collect();
         let lo = m.iter().copied().fold(f32::MAX, f32::min);
         assert!((lo - 0.05).abs() < 1e-5 && m.contains(&1.0), "{m:?}");
@@ -1366,7 +1480,7 @@ mod tests {
 
     #[test]
     fn glowing_solids_light_themselves_and_close_neighbours_only() {
-        let s = Settings { pick: [1, 1, 0, 1, 0, 1, 0, 2, 0, 1, 0, 0, 1, 1, 0, 1, 0, 4, 2, 1, 1, 0, 0] }; // cube, 4 solids, exact, glow
+        let s = Settings { pick: [1, 1, 0, 1, 0, 1, 0, 2, 0, 1, 0, 0, 2, 1, 0, 1, 0, 4, 2, 1, 1, 0, 0, 0, 0] }; // cube, 4 solids, exact, glow
         let mut sb = full(Sandbox::with_settings(7, &s));
         sb.wireframe = false;
         let c = sb.world.centre();
@@ -1462,7 +1576,7 @@ mod tests {
         let plain = sb.colors.clone();
         let palettes = Palettes::generate(5);
         let mut s = Settings::default();
-        s.pick[crate::settings::PALETTE_FIELD] = 1; // 3-bit A
+        s.pick[crate::settings::PALETTE_FIELD] = 3; // 3-bit A
         sb.set_live(&s, Some(&palettes));
         assert!(sb.has_palette());
         sb.render(w, h, &rs);
@@ -1472,7 +1586,7 @@ mod tests {
         for k in 0..w * h {
             if (ids[k] as usize) < n && plain[k] != wire_color(sb.speed_t(ids[k] as usize)) {
                 solid_cells += 1;
-                assert!(palettes.sets[0].contains(&sb.colors[k]) || sb.colors[k] >> 16 == sb.colors[k] & 0xff, "solid cell {k} in the palette");
+                assert!(palettes.sets[2].contains(&sb.colors[k]) || sb.colors[k] >> 16 == sb.colors[k] & 0xff, "solid cell {k} in the palette");
             }
             if plain[k] == EDGE_COLOR {
                 assert_eq!(sb.colors[k], EDGE_COLOR, "the container's edges keep their colour");
@@ -1483,7 +1597,7 @@ mod tests {
         assert!(used.len() <= 8 + 20, "3-bit palette (plus grey wires): {} colours", used.len());
         // low saturation pulls the solids towards grey
         let mut s = Settings::default();
-        s.pick[12] = 0;
+        s.pick[12] = 1; // low
         sb.set_live(&s, Some(&palettes));
         assert!(!sb.has_palette());
         sb.render(w, h, &rs);
@@ -1493,11 +1607,115 @@ mod tests {
         };
         let total = |cs: &[u32]| (0..w * h).filter(|&k| (ids[k] as usize) < n).map(|k| spread(cs[k])).sum::<u32>();
         assert!(total(&sb.colors) < total(&plain) * 7 / 10);
+        // saturation off: the solids in luminosity only
+        let grey = |c: u32| c >> 16 == (c >> 8) & 0xff && c >> 16 == c & 0xff;
+        s.pick[crate::settings::SATURATION_FIELD] = 0;
+        sb.set_live(&s, Some(&palettes));
+        sb.render(w, h, &rs);
+        let solid = |sb: &Sandbox| (0..w * h).filter(|&k| sb.tinted[k]).collect::<Vec<_>>();
+        assert!(solid(&sb).len() > 50 && solid(&sb).iter().all(|&k| grey(sb.colors[k])), "every solid cell grey");
+        // and with a palette, the palette collapsed to its luminosities
+        s.pick[crate::settings::PALETTE_FIELD] = 5; // 4-bit A
+        sb.set_live(&s, Some(&palettes));
+        sb.render(w, h, &rs);
+        let greys: Vec<u32> = palettes.sets[4].iter().map(|&c| saturate(c, 0.0)).collect();
+        let cells = solid(&sb);
+        assert!(cells.iter().all(|&k| greys.contains(&sb.colors[k])), "the palette's greys only");
+        let shades: std::collections::BTreeSet<u32> = cells.iter().map(|&k| sb.colors[k]).collect();
+        assert!(shades.len() >= 3, "several of its greys in use: {}", shades.len());
+    }
+
+    #[test]
+    fn optimized_shader_rasterizes_the_same_solids_dithered() {
+        let rs = render_settings(0.75);
+        let (w, h) = (120, 45);
+        let mut sb = full(Sandbox::new(11));
+        let n = sb.world.bodies.len();
+        sb.render(w, h, &rs);
+        let traced: Vec<u8> = sb.renderer.view().unwrap().ids.to_vec();
+        let traced_lum: Vec<f32> = sb.renderer.view().unwrap().radiance.iter().map(|&r| tone_map(r, EXPOSURE)).collect();
+        sb.shader = Shader::Optimized;
+        sb.render(w, h, &rs);
+        let (ids, depth) = (sb.raster.ids.clone(), sb.raster.depth.clone());
+        // the same solids in (nearly) the same cells: only edge cells differ
+        let solid = |id: u8| (id as usize) < n;
+        let both = (0..w * h).filter(|&k| solid(traced[k]) && solid(ids[k])).count();
+        let either = (0..w * h).filter(|&k| solid(traced[k]) || solid(ids[k])).count();
+        assert!(both as f32 > 0.93 * either as f32, "coverage {both} of {either}");
+        let same = (0..w * h).filter(|&k| solid(traced[k]) && traced[k] == ids[k]).count();
+        assert!(same as f32 > 0.93 * both as f32, "same solid in {same} of {both}");
+        assert!((0..w * h).all(|k| solid(ids[k]) == depth[k].is_finite()));
+        // brightness close to the path tracer's on average
+        let mean = |l: &[f32], ids: &[u8]| {
+            let v: Vec<f32> = (0..w * h).filter(|&k| solid(ids[k])).map(|k| l[k]).collect();
+            v.iter().sum::<f32>() / v.len() as f32
+        };
+        let lums: Vec<f32> = (0..w * h).map(|k| sb.raster.face[k]).map(|f| if f == NO_FACE { 0.0 } else { sb.face_shades[f as usize].lum }).collect();
+        let (a, b) = (mean(&traced_lum, &traced), mean(&lums, &ids));
+        assert!((a - b).abs() < 0.08, "mean luminosity: traced {a:.3}, optimized {b:.3}");
+        // each face is one luminosity, dithered across at most two glyphs
+        let mut by_face: std::collections::BTreeMap<u32, std::collections::BTreeSet<char>> = Default::default();
+        for k in (0..w * h).filter(|&k| sb.raster.face[k] != NO_FACE && sb.under[k].0 == NO_WIRE) {
+            by_face.entry(sb.raster.face[k]).or_default().insert(sb.chars[k]);
+        }
+        assert!(by_face.len() > 10 && by_face.values().all(|g| g.len() <= 2));
+        assert!(by_face.values().any(|g| g.len() == 2), "some faces dither");
+        // the wires, glow and the box still draw over it
+        assert!(sb.chars.iter().any(|&c| matches!(c, '-' | '|' | '/' | '\\')));
+    }
+
+    #[test]
+    fn ambient_light_darkens_solids_near_others() {
+        let rs = render_settings(0.75);
+        let (w, h) = (120, 45);
+        // eight solids packed in a cube, nearly touching
+        let mut s = Settings::default();
+        (s.pick[0], s.pick[1]) = (1, 5); // cube, 8 solids
+        s.pick[crate::settings::SHADER_FIELD] = 1;
+        let mut sb = full(Sandbox::with_settings(4, &s));
+        let (c, cam) = (sb.world.centre(), sb.scene.camera);
+        for (i, b) in sb.world.bodies.iter_mut().enumerate() {
+            let corner = |bit: usize| if i >> bit & 1 == 1 { 1.0 } else { -1.0 };
+            let r = b.radius * 1.1;
+            b.pos = c + (cam.right * corner(0) + cam.up * corner(1) + cam.forward * corner(2)) * r;
+        }
+        sb.sync();
+        let lums = |sb: &Sandbox| sb.face_shades.iter().map(|f| f.lum).collect::<Vec<f32>>();
+        sb.render(w, h, &rs);
+        let open = lums(&sb);
+        s.pick[crate::settings::AMBIENT_FIELD] = 1;
+        sb.set_live(&s, None);
+        assert!(sb.ambient);
+        sb.render(w, h, &rs);
+        let shut = lums(&sb);
+        assert_eq!(open.len(), shut.len(), "the same faces");
+        let (a, b) = (open.iter().sum::<f32>(), shut.iter().sum::<f32>());
+        assert!(b < a * 0.96, "optimized: faces darken overall {a} -> {b}");
+        let most = open.iter().zip(&shut).map(|(o, s)| 1.0 - s / o).fold(0.0, f32::max);
+        assert!(most > 0.2, "and faces turned to a near neighbour clearly: {most}");
+        assert!(open.iter().zip(&shut).all(|(o, s)| s <= o), "never brighter");
+        assert!(sb.face_shades.iter().all(|f| f.lum > 0.0), "but none go black");
+        // raymarch: short rays off each surface, with glow on
+        let frame = |sb: &mut Sandbox, ambient: bool| {
+            sb.ambient = ambient;
+            sb.renderer = Renderer::new(); // the same noise each time
+            sb.render(w, h, &rs);
+            sb.chars.clone()
+        };
+        sb.shader = Shader::Raymarch;
+        sb.glow = Glow::Low;
+        let (lit, dark) = (frame(&mut sb, false), frame(&mut sb, true));
+        let ramp = platomon::ascii::DEFAULT_RAMP;
+        let level = |c: char| ramp.chars().position(|g| g == c);
+        let pairs: Vec<(usize, usize)> = lit.iter().zip(&dark).filter_map(|(&a, &b)| Some((level(a)?, level(b)?))).collect();
+        let darker = pairs.iter().filter(|(a, b)| b < a).count();
+        assert!(pairs.iter().all(|(a, b)| b <= a), "raymarch: no cell brighter");
+        assert!(darker > 10, "raymarch: the cells between close solids darker: {darker}");
     }
 
     #[test]
     fn an_explosion_throws_every_face_out_and_the_solid_comes_back() {
-        let mut sb = full(Sandbox::with_settings(8, &Settings { pick: [1, 1, 0, 1, 0, 0, 0, 2, 0, 0, 0, 0, 1, 1, 0, 1, 0, 4, 2, 1, 1, 0, 0] }));
+        let mut sb = full(Sandbox::with_settings(8, &Settings { pick: [1, 1, 0, 1, 0, 0, 0, 2, 0, 0, 0, 0, 2, 1, 0, 1, 0, 4, 2, 1, 1, 0, 0, 0, 0] }));
         let c = sb.world.centre();
         for b in &mut sb.world.bodies {
             b.vel = Vec3A::ZERO;
@@ -1524,7 +1742,7 @@ mod tests {
         assert_ne!(before, sb.colors, "the fragments are drawn");
         assert!(sb.chars.iter().filter(|&&ch| ch != ' ').count() > 100);
         // twice as violent: twice as fast
-        let mut sb2 = full(Sandbox::with_settings(8, &Settings { pick: [1, 1, 0, 1, 0, 0, 0, 2, 0, 0, 0, 0, 1, 1, 0, 1, 0, 4, 2, 1, 1, 0, 0] }));
+        let mut sb2 = full(Sandbox::with_settings(8, &Settings { pick: [1, 1, 0, 1, 0, 0, 0, 2, 0, 0, 0, 0, 2, 1, 0, 1, 0, 4, 2, 1, 1, 0, 0, 0, 0] }));
         sb2.world.bodies[0].vel = Vec3A::ZERO;
         sb2.world.blast(0, 2.0);
         sb2.step(1.0 / 30.0);
@@ -1930,15 +2148,15 @@ mod tests {
         // with a palette: the covered colour's palette index rotated by half the depth
         let palettes = Palettes::generate(3);
         let mut s = Settings::default();
-        (s.pick[crate::settings::PALETTE_FIELD], s.pick[14]) = (7, 3); // 6-bit A, bit-shift
+        (s.pick[crate::settings::PALETTE_FIELD], s.pick[14]) = (9, 3); // 6-bit A, bit-shift
         sb.set_live(&s, Some(&palettes));
         sb.render(w, h, &rs);
-        let q = Quantizer::new(&palettes.sets[6]);
+        let q = Quantizer::new(&palettes.sets[8]);
         for &k in &wires {
             let (u, solid, _) = sb.under[k];
             let covered = if solid { q.map(u) } else { u };
             assert_eq!(sb.colors[k], q.bit_shift(covered));
-            assert!(palettes.sets[6].contains(&sb.colors[k]));
+            assert!(palettes.sets[8].contains(&sb.colors[k]));
         }
         // the palette no longer recolours velocity wires
         s.pick[14] = 0;

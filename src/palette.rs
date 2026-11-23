@@ -1,5 +1,5 @@
-//! Random colour palettes the solids can be drawn in (two each of 3-, 4-,
-//! 5- and 6-bit, i.e. 8 to 64 colours), the saturation control, and the
+//! Random colour palettes the solids can be drawn in (two each of 2-, 3-,
+//! 4-, 5- and 6-bit, i.e. 4 to 64 colours), the saturation control, and the
 //! nearest-colour lookup that maps any colour onto a palette.
 //!
 //! The palettes are generated once, saved with the settings, and only
@@ -8,7 +8,7 @@
 use crate::physics::hsv;
 
 /// Bits per colour of each palette, in the order the dialog lists them.
-pub const BITS: [u32; 8] = [3, 3, 4, 4, 5, 5, 6, 6];
+pub const BITS: [u32; 10] = [2, 2, 3, 3, 4, 4, 5, 5, 6, 6];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Palettes {
@@ -32,10 +32,11 @@ const HUE_SHIFT: f32 = 0.55;
 const END_DESATURATE: f32 = 0.5;
 
 /// How a palette of `bits` is built: whether it has one shared shadow and
-/// one shared highlight (strict 8- and 16-colour palettes), and its number
+/// one shared highlight (strict 4-, 8- and 16-colour palettes), and its number
 /// of hue ramps × steps per ramp.
 pub fn plan(bits: u32) -> (bool, usize, usize) {
     match bits {
+        ..=2 => (true, 1, 2), // shadow + 1 ramp × 2 + highlight = 4
         3 => (true, 2, 3),  // shadow + 2 ramps × 3 + highlight = 8
         4 => (true, 2, 7),  // shadow + 2 ramps × 7 + highlight = 16
         5 => (false, 4, 8), // 4 ramps × 8 = 32
@@ -74,7 +75,7 @@ pub fn at_luma(h: f32, s: f32, target: f32) -> u32 {
 /// - a value ladder: every colour has its own brightness, evenly spaced
 ///   from very dark to very light (interleaved across ramps), so no two
 ///   merge into one grey;
-/// - shared ends: 8- and 16-colour palettes have one shadow and one
+/// - shared ends: 4-, 8- and 16-colour palettes have one shadow and one
 ///   highlight that every ramp runs into;
 /// - saturation: rich midtones, the darkest and lightest steps calmer.
 pub fn build(bits: u32, rng: &mut fastrand::Rng) -> (Vec<u32>, Vec<Vec<u32>>) {
@@ -125,7 +126,7 @@ fn random_palette(bits: u32, rng: &mut fastrand::Rng) -> Vec<u32> {
 }
 
 impl Palettes {
-    /// A fresh set of eight random palettes.
+    /// A fresh set of ten random palettes.
     pub fn generate(seed: u64) -> Self {
         let mut rng = fastrand::Rng::with_seed(seed);
         Self { sets: BITS.iter().map(|&b| random_palette(b, &mut rng)).collect() }
@@ -140,13 +141,23 @@ impl Palettes {
     }
 
     /// Read [`to_text`](Self::to_text) output; `None` unless every palette
-    /// is there at its full size.
+    /// is there at its full size. A file from before the 2-bit palettes
+    /// keeps its eight and gets two new 2-bit ones.
     pub fn from_text(text: &str) -> Option<Self> {
-        let sets: Vec<Vec<u32>> = text
+        let mut sets: Vec<Vec<u32>> = text
             .lines()
             .filter(|l| !l.trim().is_empty())
             .map(|l| l.split_whitespace().map(|h| u32::from_str_radix(h, 16).ok().filter(|&c| c <= 0xff_ff_ff)).collect())
             .collect::<Option<_>>()?;
+        // the 2-bit pair at the front of BITS is what older files lack
+        let new = if sets.len() + 2 == BITS.len() { 2 } else { 0 };
+        if new > 0 {
+            // seeded from the old palettes, so the same file always gets the same two
+            let seed = sets.iter().flatten().fold(0xcbf2_9ce4_8422_2325u64, |h, &c| (h ^ c as u64).wrapping_mul(0x100_0000_01b3));
+            let mut rng = fastrand::Rng::with_seed(seed);
+            let fresh: Vec<Vec<u32>> = BITS[..new].iter().map(|&b| random_palette(b, &mut rng)).collect();
+            sets.splice(0..0, fresh);
+        }
         let sizes_ok = sets.len() == BITS.len() && sets.iter().zip(BITS).all(|(p, b)| p.len() == 1 << b);
         sizes_ok.then_some(Self { sets })
     }
@@ -238,7 +249,7 @@ mod tests {
     #[test]
     fn palettes_have_the_right_sizes_and_span_dark_to_light() {
         let p = Palettes::generate(1);
-        assert_eq!(p.sets.iter().map(Vec::len).collect::<Vec<_>>(), [8, 8, 16, 16, 32, 32, 64, 64]);
+        assert_eq!(p.sets.iter().map(Vec::len).collect::<Vec<_>>(), [4, 4, 8, 8, 16, 16, 32, 32, 64, 64]);
         for s in &p.sets {
             assert!(s.windows(2).all(|w| luma(w[0]) <= luma(w[1])), "darkest first");
             assert!(luma(s[0]) < 70.0 && luma(*s.last().unwrap()) > 150.0, "spans the brightness range");
@@ -294,7 +305,7 @@ mod tests {
     fn ramps_shift_hue_cold_in_shadow_and_warm_in_light() {
         for seed in 0..20 {
             let mut rng = fastrand::Rng::with_seed(seed);
-            for bits in [3, 4, 5, 6] {
+            for bits in [2, 3, 4, 5, 6] {
                 let (_, ramps) = build(bits, &mut rng);
                 for ramp in &ramps {
                     let (dark, light) = (ramp[0], *ramp.last().unwrap());
@@ -319,7 +330,7 @@ mod tests {
     #[test]
     fn strict_palettes_share_one_shadow_and_one_highlight() {
         let mut rng = fastrand::Rng::with_seed(4);
-        for bits in [3, 4] {
+        for bits in [2, 3, 4] {
             let (flat, ramps) = build(bits, &mut rng);
             let in_ramps: Vec<u32> = ramps.iter().flatten().copied().collect();
             let extra: Vec<u32> = flat.iter().copied().filter(|c| !in_ramps.contains(c)).collect();
@@ -343,10 +354,16 @@ mod tests {
         let p = Palettes::generate(7);
         assert_eq!(Palettes::from_text(&p.to_text()), Some(p.clone()));
         let text = p.to_text();
-        let short: String = text.lines().take(7).map(|l| format!("{l}\n")).collect();
+        let short: String = text.lines().take(9).map(|l| format!("{l}\n")).collect();
         assert_eq!(Palettes::from_text(&short), None, "a palette missing");
         assert_eq!(Palettes::from_text(&text.replacen(' ', " zz ", 1)), None, "junk");
         assert_eq!(Palettes::from_text(""), None);
+        // a file from before the 2-bit palettes keeps its own and gains two
+        let old: String = text.lines().skip(2).map(|l| format!("{l}\n")).collect();
+        let up = Palettes::from_text(&old).expect("an 8-palette file still loads");
+        assert_eq!(up.sets[2..], p.sets[2..]);
+        assert_eq!((up.sets[0].len(), up.sets[1].len()), (4, 4));
+        assert_eq!(Palettes::from_text(&old), Some(up), "the same two every time");
     }
 
     #[test]
@@ -371,7 +388,7 @@ mod tests {
         assert_eq!(rotate_bits(0b000111, 3, 6), 0b111000);
         assert_eq!(bit_shift_24(0x123456), 0x456123);
         let p = Palettes::generate(2);
-        for (set, half) in p.sets.iter().zip([1, 1, 2, 2, 2, 2, 3, 3]) {
+        for (set, half) in p.sets.iter().zip([1, 1, 1, 1, 2, 2, 2, 2, 3, 3]) {
             let q = Quantizer::new(set);
             assert_eq!(q.bits() / 2, half);
             for (i, &c) in set.iter().enumerate() {

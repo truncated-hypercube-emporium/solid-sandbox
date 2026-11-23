@@ -563,6 +563,7 @@ dependencies = [
  "fastrand",
  "glam",
  "platomon",
+ "rayon",
 ]
 
 [[package]]

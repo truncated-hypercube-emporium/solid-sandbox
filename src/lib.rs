@@ -24,6 +24,7 @@ pub mod palette;
 pub mod physics;
 pub mod sandbox;
 pub mod settings;
+pub mod shade;
 pub mod ui;
 
 use font::{CELL_H, CELL_W, Font, GLYPH_W};

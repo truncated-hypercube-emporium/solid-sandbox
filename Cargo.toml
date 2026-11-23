@@ -16,6 +16,8 @@ path = "src/lib.rs"
 platomon = { path = "platomon", default-features = false }
 fastrand = "2.5.0"
 glam = "0.34.3"
+# the raymarch shader's ambient-light rays run on every core, like its frames
+rayon = "1.12.0"
 
 [dev-dependencies]
 # examples/terminal.rs: run the sandbox in a terminal on the desktop

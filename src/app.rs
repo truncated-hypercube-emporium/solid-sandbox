@@ -145,6 +145,12 @@ impl App {
                 }
                 // colours, explosions and performance apply to the running scene
                 self.sb.set_live(&s, Some(&self.palettes));
+                if s.shader() != before.shader() {
+                    // the cells the frame budget affords depend on the shader
+                    self.spc = sandbox::seconds_per_cell(&mut self.sb, &self.rs);
+                    self.base_scale = scale_for(self.grid.w, self.grid.h, self.spc);
+                    (self.log)(&format!("{:?} shader: {:.2} us/cell", s.shader(), self.spc * 1e6));
+                }
                 let scale = char_scale(self.base_scale, s.char_scale());
                 if scale != self.grid.scale {
                     self.grid = Grid::new(self.grid.w, self.grid.h, scale);

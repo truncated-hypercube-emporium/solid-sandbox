@@ -4,7 +4,7 @@
 
 use crate::font::{CELL_H, CELL_W, Font, GLYPH_W};
 use crate::rgbx;
-use crate::settings::{COLOUR_FIELDS, FIELDS, PALETTE_FIELD, SETTINGS_FIELDS, SIMULATION_FIELDS, Settings};
+use crate::settings::{AMBIENT_FIELD, COLOUR_FIELDS, FIELDS, SETTINGS_FIELDS, SIMULATION_FIELDS, Settings};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Rect {
@@ -28,8 +28,12 @@ pub struct Row {
     pub value: Rect,
     pub prev: Rect,
     pub next: Rect,
-    /// The square button beside the value (the palette row's "new palettes").
-    pub button: Option<Rect>,
+}
+
+/// Whether field `f` can be changed in `s` (Ambient light needs a shader
+/// that can afford it).
+pub fn enabled(s: &Settings, f: usize) -> bool {
+    f != AMBIENT_FIELD || s.ambient_available()
 }
 
 /// Inset of the palette and colour buttons' four colour squares from their
@@ -64,11 +68,11 @@ const VALUE_COLS: i32 = 16;
 /// Which dialog is showing, each opened by its own screen button.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum View {
-    /// The menu button's.
+    /// The menu button's "Game Settings".
     Settings,
     /// The cogwheel's.
     Simulation,
-    /// The colour button's.
+    /// The colour button's "Rendering Options".
     Colour,
 }
 
@@ -85,9 +89,9 @@ impl View {
 
     pub fn title(self) -> &'static str {
         match self {
-            View::Settings => "Settings",
+            View::Settings => "Game Settings",
             View::Simulation => "Simulation Parameters",
-            View::Colour => "Colour",
+            View::Colour => "Rendering Options",
         }
     }
 
@@ -104,6 +108,9 @@ pub struct Page {
     pub panel: Rect,
     pub title_y: i32,
     pub rows: Vec<Row>,
+    /// The palette (colour switcher) button: on the Rendering Options
+    /// title's line, centred over the rows' `>` arrows.
+    pub swatch: Option<Rect>,
     pub cancel: Rect,
     pub apply: Rect,
 }
@@ -114,7 +121,7 @@ impl Page {
         pad * 2 + row_h * (n + 2) + row_h / 2
     }
 
-    fn new(w: i32, h: i32, (cw, ch): (i32, i32), (pad, row_h): (i32, i32), fields: &'static [usize]) -> Self {
+    fn new(w: i32, h: i32, (cw, ch): (i32, i32), (pad, row_h): (i32, i32), fields: &'static [usize], swatch: bool) -> Self {
         let n = fields.len() as i32;
         let pw = pad * 2 + (LABEL_COLS + VALUE_COLS) * cw;
         let ph = Self::height(n, pad, row_h);
@@ -122,28 +129,22 @@ impl Page {
         let rows = fields
             .iter()
             .enumerate()
-            .map(|(i, &f)| {
+            .map(|(i, _)| {
                 let y = panel.y + pad + row_h * (i as i32 + 1);
-                let mut value = Rect { x: panel.x + pad + LABEL_COLS * cw, y, w: VALUE_COLS * cw, h: row_h };
-                // the palette row gives up the left end of its value for a
-                // square button, a small gap before the cycler
-                let button = (f == PALETTE_FIELD).then(|| {
-                    let gap = (cw / 2).max(2);
-                    let b = Rect { x: value.x, y, w: row_h, h: row_h };
-                    value.x += row_h + gap;
-                    value.w -= row_h + gap;
-                    b
-                });
+                let value = Rect { x: panel.x + pad + LABEL_COLS * cw, y, w: VALUE_COLS * cw, h: row_h };
                 let half = value.w / 2;
                 Row {
                     label: (panel.x + pad, y + (row_h - ch) / 2),
                     value,
                     prev: Rect { w: half, ..value },
                     next: Rect { x: value.x + half, w: value.w - half, ..value },
-                    button,
                 }
             })
             .collect();
+        // a square as tall as a row on the title's line, its middle under
+        // the middle of the rows' `>` arrows
+        let arrow_mid = panel.x + pad + (LABEL_COLS + VALUE_COLS) * cw - arrow_inset(cw) + GLYPH_W as i32 * cw / CELL_W as i32 / 2;
+        let swatch = swatch.then_some(Rect { x: arrow_mid - row_h / 2, y: panel.y + pad, w: row_h, h: row_h });
         let by = panel.y + ph - pad - row_h;
         let bw = (pw - pad * 3) / 2;
         Self {
@@ -151,6 +152,7 @@ impl Page {
             panel,
             title_y: panel.y + pad + (row_h - ch) / 2,
             rows,
+            swatch,
             cancel: Rect { x: panel.x + pad, y: by, w: bw, h: row_h },
             apply: Rect { x: panel.x + pad * 2 + bw, y: by, w: bw, h: row_h },
         }
@@ -205,7 +207,7 @@ impl Layout {
                 Rect { x: w - 2 * (m + bs), y: m, w: bs, h: bs },
                 Rect { x: w - m - bs, y: 2 * m + bs, w: bs, h: bs },
             ],
-            pages: View::ALL.map(|v| Page::new(w, h, (cw, ch), spacing, v.fields())),
+            pages: View::ALL.map(|v| Page::new(w, h, (cw, ch), spacing, v.fields(), v == View::Colour)),
             stats_ts: (h.min(w) / 270).max(1),
         }
     }
@@ -314,11 +316,15 @@ impl Ui {
             self.draft = None;
             return Tap::Apply(s);
         }
+        if page.swatch.is_some_and(|b| b.contains(x, y)) {
+            self.swatches = if self.swatch_presses % 2 == 0 { rotate_swatches(self.swatches) } else { mirror_swatches(self.swatches) };
+            self.swatch_presses += 1;
+            return Tap::NewPalettes;
+        }
         for (row, &f) in page.rows.iter().zip(page.fields) {
-            if row.button.is_some_and(|b| b.contains(x, y)) {
-                self.swatches = if self.swatch_presses % 2 == 0 { rotate_swatches(self.swatches) } else { mirror_swatches(self.swatches) };
-                self.swatch_presses += 1;
-                return Tap::NewPalettes;
+            let on_row = row.prev.contains(x, y) || row.next.contains(x, y);
+            if on_row && !enabled(d, f) {
+                return Tap::Ui;
             }
             if row.prev.contains(x, y) {
                 d.step(f, -1);
@@ -360,19 +366,26 @@ impl Ui {
             c.fill(page.panel, 0x10_16_20);
             c.outline(page.panel, ts.max(1), 0x5a_6a_88);
             c.text_centered(font, page.panel.x + page.panel.w / 2, page.title_y, ts, self.view.title(), 0xff_ff_ff);
+            if let Some(b) = page.swatch {
+                draw_swatch_button(c, b, ts, self.swatches, Centre::Square);
+            }
+            let cw = CELL_W as i32 * ts;
             for (row, &f) in page.rows.iter().zip(page.fields) {
-                c.text(font, row.label.0, row.label.1, ts, FIELDS[f].label, 0xa0_ae_c4);
+                let on = enabled(d, f);
+                c.text(font, row.label.0, row.label.1, ts, FIELDS[f].label, if on { 0xa0_ae_c4 } else { DISABLED });
                 c.fill(row.value, 0x1c_24_32);
                 let ty = row.label.1;
+                if !on {
+                    // not available with this shader: shown off, greyed, no arrows
+                    c.text_centered(font, row.value.x + row.value.w / 2, ty, ts, FIELDS[f].choices[0], DISABLED);
+                    continue;
+                }
                 let arrow = 0x7f_90_b0;
-                c.text(font, row.value.x + CELL_W as i32 * ts / 2, ty, ts, "<", arrow);
-                c.text(font, row.value.x + row.value.w - CELL_W as i32 * ts * 3 / 2, ty, ts, ">", arrow);
+                c.text(font, row.value.x + cw / 2, ty, ts, "<", arrow);
+                c.text(font, row.value.x + row.value.w - arrow_inset(cw), ty, ts, ">", arrow);
                 // a value that differs from the one in force is highlighted
                 let ink = if d.pick[f] != self.current.pick[f] { 0xff_d8_60 } else { 0xff_ff_ff };
                 c.text_centered(font, row.value.x + row.value.w / 2, ty, ts, d.value(f), ink);
-                if let Some(b) = row.button {
-                    draw_swatch_button(c, b, ts, self.swatches, Centre::Square);
-                }
             }
             for (r, label, bg) in [(page.cancel, "Cancel", 0x2a_32_42), (page.apply, "Apply", 0x2c_5a_9e)] {
                 c.fill(r, bg);
@@ -403,6 +416,14 @@ impl Ui {
             }
         }
     }
+}
+
+/// Ink of a row that can't be changed.
+const DISABLED: u32 = 0x4a_52_62;
+
+/// How far left of a value box's right edge its `>` arrow starts.
+fn arrow_inset(cw: i32) -> i32 {
+    cw * 3 / 2
 }
 
 /// Teeth on the cogwheel.
@@ -640,9 +661,12 @@ mod tests {
             labels(View::Simulation),
             ["Sim speed", "Framerate", "Sim stepping", "Character scale", "Collisions", "Elasticity", "Damping", "Gravity", "Mass variability"]
         );
-        assert_eq!(labels(View::Colour), ["Colour mode", "Palette", "Saturation", "Wire colour", "Glow colour"]);
-        assert_eq!(labels(View::Settings), ["Container", "Solids", "Wireframe", "Tap speed", "Glow", "Explosions", "Charge", "Spawn", "Dynamic camera"]);
-        assert_eq!(View::Simulation.title(), "Simulation Parameters");
+        assert_eq!(
+            labels(View::Colour),
+            ["Shader", "Ambient light", "Colour mode", "Palette", "Saturation", "Wire colour", "Glow", "Glow colour"]
+        );
+        assert_eq!(labels(View::Settings), ["Container", "Solids", "Wireframe", "Tap speed", "Explosions", "Charge", "Spawn", "Dynamic camera"]);
+        assert_eq!(View::ALL.map(View::title), ["Game Settings", "Simulation Parameters", "Rendering Options"]);
     }
 
     #[test]
@@ -710,7 +734,7 @@ mod tests {
         tap(&mut ui, colour);
         assert_eq!((ui.view, ui.draft), (View::Colour, Some(d)));
         assert!(ui.edited(View::Simulation) && !ui.edited(View::Colour));
-        let c = ui.layout.page(View::Colour).rows[0];
+        let c = ui.layout.page(View::Colour).rows[2]; // colour mode
         tap(&mut ui, c.next);
         // the showing dialog's button closes it; the others switch
         tap(&mut ui, menu);
@@ -729,20 +753,33 @@ mod tests {
     }
 
     #[test]
-    fn palette_button_sits_beside_the_palette_cycler() {
+    fn palette_button_sits_beside_the_title_over_the_arrows() {
+        for (w, h) in [(2009, 1080), (1280, 720), (800, 480), (320, 240)] {
+            let l = Layout::new(w, h);
+            let p = l.page(View::Colour);
+            let b = p.swatch.unwrap();
+            assert!(l.pages.iter().filter(|p| p.swatch.is_some()).count() == 1, "only on Rendering Options");
+            let row = p.rows[0];
+            assert_eq!((b.w, b.h), (row.value.h, row.value.h), "{w}x{h}: square, as tall as a row");
+            // on the title's line, between the panel's top and the first row
+            let ch = CELL_H as i32 * l.ts;
+            assert!(b.y <= p.title_y && b.y + b.h >= p.title_y + ch && b.y + b.h <= row.value.y, "{w}x{h}: on the title line");
+            // right of the title text, inside the panel
+            let cw = CELL_W as i32 * l.ts;
+            let title_end = p.panel.x + p.panel.w / 2 + View::Colour.title().len() as i32 * cw / 2;
+            assert!(b.x > title_end && b.x + b.w <= p.panel.x + p.panel.w, "{w}x{h}: {b:?} clear of the title, in the panel");
+            // its middle in line with the middle of the `>` arrows below it
+            let arrow_mid = row.value.x + row.value.w - arrow_inset(cw) + GLYPH_W as i32 * l.ts / 2;
+            assert!((b.x + b.w / 2 - arrow_mid).abs() <= 1, "{w}x{h}: centred over the arrows");
+        }
         let mut ui = shown(2009, 1080, Settings::default());
         let colour = ui.layout.buttons[2];
         tap(&mut ui, colour);
+        let b = ui.layout.page(View::Colour).swatch.unwrap();
         let rows = ui.layout.page(View::Colour).rows.clone();
-        let i = COLOUR_FIELDS.iter().position(|&f| f == PALETTE_FIELD).unwrap();
-        let (row, b) = (rows[i], rows[i].button.unwrap());
-        assert!(rows.iter().enumerate().all(|(k, r)| r.button.is_some() == (k == i)), "only the palette row has one");
-        assert!(ui.layout.pages.iter().flat_map(|p| &p.rows).filter(|r| r.button.is_some()).count() == 1);
-        assert_eq!((b.w, b.h), (row.value.h, row.value.h), "square, as tall as the row");
-        assert!(b.x + b.w <= row.value.x && b.y == row.value.y, "left of the cycler");
-        let label_end = row.label.0 + (FIELDS[PALETTE_FIELD].label.len() as i32) * CELL_W as i32 * ui.layout.ts;
-        assert!(b.x > label_end, "clear of the label");
-        assert!(row.value.x + row.value.w == rows[0].value.x + rows[0].value.w, "the cycler still ends with the others");
+        let i = COLOUR_FIELDS.iter().position(|&f| f == crate::settings::PALETTE_FIELD).unwrap();
+        let row = rows[i];
+        assert!(rows.iter().all(|r| r.value.x == row.value.x && r.value.w == row.value.w), "the palette cycler is as wide as the rest");
         let before = ui.draft;
         assert_eq!(tap(&mut ui, b), Tap::NewPalettes);
         assert_eq!(ui.draft, before, "it changes no setting");
@@ -762,6 +799,25 @@ mod tests {
         assert_eq!(ui.draft.unwrap().palette(), Some(0));
     }
 
+    #[test]
+    fn ambient_light_row_follows_the_shader() {
+        use crate::settings::{AMBIENT_WITH_RAYMARCH, SHADER_FIELD};
+        let mut ui = shown(1280, 720, Settings::default());
+        let colour = ui.layout.buttons[2];
+        tap(&mut ui, colour);
+        let rows = ui.layout.page(View::Colour).rows.clone();
+        let at = |f: usize| COLOUR_FIELDS.iter().position(|&g| g == f).unwrap();
+        let (shader, ambient) = (rows[at(SHADER_FIELD)], rows[at(AMBIENT_FIELD)]);
+        tap(&mut ui, ambient.next);
+        assert_eq!(ui.draft.unwrap().pick[AMBIENT_FIELD] == 1, AMBIENT_WITH_RAYMARCH, "steps with the raymarch shader only if it can afford it");
+        tap(&mut ui, shader.next);
+        assert_eq!(ui.draft.unwrap().value(SHADER_FIELD), "Optimized");
+        if !AMBIENT_WITH_RAYMARCH {
+            tap(&mut ui, ambient.next);
+        }
+        assert!(ui.draft.unwrap().ambient(), "always available with the optimized shader");
+    }
+
     /// White pixels in the 24×24 square round (`cx`, `cy`).
     fn whites(px: &[u32], stride: usize, cx: i32, cy: i32) -> usize {
         (cy - 12..cy + 12).flat_map(|y| (cx - 12..cx + 12).map(move |x| (x, y))).filter(|&(x, y)| px[y as usize * stride + x as usize] == rgbx(0xffffff)).count()
@@ -776,8 +832,7 @@ mod tests {
         ui.draft = Some(Settings::default());
         ui.view = View::Colour;
         ui.draw(&mut Canvas { px: &mut px, stride, w, h }, &font, &[]);
-        let i = COLOUR_FIELDS.iter().position(|&f| f == PALETTE_FIELD).unwrap();
-        let b = ui.layout.page(View::Colour).rows[i].button.unwrap();
+        let b = ui.layout.page(View::Colour).swatch.unwrap();
         let at = |px: &[u32], x: i32, y: i32| px[y as usize * stride + x as usize];
         let m = SWATCH_MARGIN;
         let (l, r, t, bt) = (b.x + m, b.x + b.w - m - 1, b.y + m, b.y + b.h - m - 1);

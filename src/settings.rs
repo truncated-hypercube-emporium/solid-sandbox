@@ -13,11 +13,11 @@ pub struct Field {
 }
 
 /// The fields of each dialog, in the order shown: the menu button's
-/// "Settings", the cogwheel's "Simulation Parameter" and the colour button's
-/// "Colour".
-pub const SETTINGS_FIELDS: [usize; 9] = [0, 1, 2, 3, 9, 13, 15, 16, CAMERA_FIELD];
+/// "Game Settings", the cogwheel's "Simulation Parameters" and the colour
+/// button's "Rendering Options".
+pub const SETTINGS_FIELDS: [usize; 8] = [0, 1, 2, 3, 13, 15, 16, CAMERA_FIELD];
 pub const SIMULATION_FIELDS: [usize; 9] = [17, 18, 19, CHAR_SCALE_FIELD, 5, 7, 8, 4, 6];
-pub const COLOUR_FIELDS: [usize; 5] = [10, PALETTE_FIELD, 12, 14, GLOW_COLOUR_FIELD];
+pub const COLOUR_FIELDS: [usize; 8] = [SHADER_FIELD, AMBIENT_FIELD, 10, PALETTE_FIELD, 12, 14, GLOW_FIELD, GLOW_COLOUR_FIELD];
 /// Fields that need a fresh scene when they change (these and
 /// [`SPAWN_FIELD`]); the rest apply live.
 pub const SCENE_FIELDS: std::ops::Range<usize> = 0..9;
@@ -30,8 +30,15 @@ pub const CHAR_SCALE_FIELD: usize = 20;
 /// The dynamic camera, and the glow's colour.
 pub const CAMERA_FIELD: usize = 21;
 pub const GLOW_COLOUR_FIELD: usize = 22;
+/// Glow, the shader (path-traced raymarching or the optimized face
+/// rasterizer) and ambient light.
+pub const GLOW_FIELD: usize = 9;
+pub const SHADER_FIELD: usize = 23;
+pub const AMBIENT_FIELD: usize = 24;
+/// Saturation, whose "Off" turns everything (and the palette) grey.
+pub const SATURATION_FIELD: usize = 12;
 
-pub const FIELDS: [Field; 23] = [
+pub const FIELDS: [Field; 25] = [
     Field {
         key: "container",
         label: "Container",
@@ -50,9 +57,9 @@ pub const FIELDS: [Field; 23] = [
     Field {
         key: "palette",
         label: "Palette",
-        choices: &["Off", "3-bit A", "3-bit B", "4-bit A", "4-bit B", "5-bit A", "5-bit B", "6-bit A", "6-bit B"],
+        choices: &["Off", "2-bit A", "2-bit B", "3-bit A", "3-bit B", "4-bit A", "4-bit B", "5-bit A", "5-bit B", "6-bit A", "6-bit B"],
     },
-    Field { key: "saturation", label: "Saturation", choices: &["Low", "Medium", "High"] },
+    Field { key: "saturation", label: "Saturation", choices: &["Off", "Low", "Medium", "High"] },
     Field { key: "explosions", label: "Explosions", choices: &["Off", "Weak", "Strong"] },
     Field { key: "wire_colour", label: "Wire colour", choices: &["Velocity", "White", "Inverted", "Bit-shift"] },
     Field { key: "charge", label: "Charge", choices: &["Low", "Medium", "High"] },
@@ -64,7 +71,27 @@ pub const FIELDS: [Field; 23] = [
     Field { key: "char_scale", label: "Character scale", choices: &["0.5", "1", "2"] },
     Field { key: "camera", label: "Dynamic camera", choices: &["Off", "On"] },
     Field { key: "glow_colour", label: "Glow colour", choices: &["Inherited", "White"] },
+    Field { key: "shader", label: "Shader", choices: &["Raymarch", "Optimized"] },
+    Field { key: "ambient", label: "Ambient light", choices: &["Off", "On"] },
 ];
+
+/// How the solids are shaded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Shader {
+    /// platomon's path tracer: sphere-traced SDFs, one bounce, soft shadows.
+    Raymarch,
+    /// Faces rasterized flat, each lit once per frame from a lookup table
+    /// and ordered-dithered between two glyph levels.
+    Optimized,
+}
+
+/// Whether "Ambient light" works with the raymarch shader too (with glow
+/// on, by short occlusion rays). `examples/bench_shading.rs` measured, over
+/// a raymarch + glow frame: 1 ray +12% (but it catches almost nothing), 2
+/// rays +21–27%, 3 rays +22–39%; the optimized shader's ambient light costs
+/// nothing measurable. Too costly, so the setting is only offered with the
+/// optimized shader.
+pub const AMBIENT_WITH_RAYMARCH: bool = false;
 
 /// Text-cell size multiplier per "Character scale".
 const CHAR_SCALES: [f32; 3] = [0.5, 1.0, 2.0];
@@ -93,8 +120,9 @@ pub enum Explosions {
     Strong,
 }
 
-/// Saturation scale for "Low", "Medium" (the colours as designed) and "High".
-const SATURATION: [f32; 3] = [0.45, 1.0, 1.6];
+/// Saturation scale for "Off" (luminosity only), "Low", "Medium" (the
+/// colours as designed) and "High".
+const SATURATION: [f32; 4] = [0.0, 0.45, 1.0, 1.6];
 
 /// What a solid's colour follows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -171,7 +199,7 @@ impl Default for Settings {
     /// medium saturation, explosions on; real-time speed, 30 fps, 240
     /// sub-steps a second.
     fn default() -> Self {
-        Self { pick: [0, 0, 0, 1, 0, 0, 0, 2, 0, 0, 0, 0, 1, 1, 0, 1, 0, 4, 2, 1, 1, 0, 0] }
+        Self { pick: [0, 0, 0, 1, 0, 0, 0, 2, 0, 0, 0, 0, 2, 1, 0, 1, 0, 4, 2, 1, 1, 0, 0, 0, 0] }
     }
 }
 
@@ -237,7 +265,26 @@ impl Settings {
 
     /// How solids glow.
     pub fn glow(&self) -> Glow {
-        [Glow::Off, Glow::Low, Glow::Medium, Glow::High][self.pick[9]]
+        [Glow::Off, Glow::Low, Glow::Medium, Glow::High][self.pick[GLOW_FIELD]]
+    }
+
+    /// How the solids are shaded.
+    pub fn shader(&self) -> Shader {
+        [Shader::Raymarch, Shader::Optimized][self.pick[SHADER_FIELD]]
+    }
+
+    /// Whether "Ambient light" can be changed with this shader (see
+    /// [`ambient`](Self::ambient)).
+    pub fn ambient_available(&self) -> bool {
+        AMBIENT_WITH_RAYMARCH || self.shader() == Shader::Optimized
+    }
+
+    /// Whether solids darken each other where they are close: the
+    /// optimized shader from the distance between solids' centres (and, if
+    /// [`AMBIENT_WITH_RAYMARCH`], the raymarch shader with glow on from
+    /// short rays cast off each surface).
+    pub fn ambient(&self) -> bool {
+        self.pick[AMBIENT_FIELD] == 1 && self.ambient_available()
     }
 
     /// Text-cell size multiplier (1: as 1.10 sized them).
@@ -255,9 +302,9 @@ impl Settings {
         self.pick[PALETTE_FIELD].checked_sub(1)
     }
 
-    /// Saturation scale (1: as designed).
+    /// Saturation scale (1: as designed, 0: "Off", luminosity only).
     pub fn saturation(&self) -> f32 {
-        SATURATION[self.pick[12]]
+        SATURATION[self.pick[SATURATION_FIELD]]
     }
 
     /// Whether worn-out solids can explode, and how hard.
@@ -351,7 +398,7 @@ mod tests {
         assert!(!s.exact(), "sphere collisions by default");
         assert_eq!((s.lightest(), s.elasticity(), s.damping(), s.glow()), (1.0, physics::RESTITUTION, 1.0, Glow::Off));
         assert_eq!((s.sim_speed(), s.fps(), s.step_hz()), (1.0, 30.0, physics::STEP_HZ));
-        s.pick = [4, 9, 1, 2, 2, 1, 3, 0, 3, 1, 0, 0, 1, 1, 0, 1, 0, 6, 4, 3, 1, 0, 0];
+        s.pick = [4, 9, 1, 2, 2, 1, 3, 0, 3, 1, 0, 0, 2, 1, 0, 1, 0, 6, 4, 3, 1, 0, 0, 0, 0];
         assert!(s.exact());
         assert_eq!(s.container(), Some(SolidKind::Icosahedron));
         assert_eq!(s.solids(), Some(12));
@@ -361,7 +408,7 @@ mod tests {
         assert_eq!((s.lightest(), s.elasticity(), s.damping(), s.glow()), (0.05, 0.0, 0.5, Glow::Low));
         assert_eq!((s.sim_speed(), s.fps(), s.step_hz()), (2.0, 60.0, 960.0));
         assert_eq!((s.colour_by(), s.palette(), s.saturation(), s.explosions()), (ColourBy::Velocity, None, 1.0, Explosions::Weak));
-        s.pick[10..14].copy_from_slice(&[2, 8, 0, 0]);
+        s.pick[10..14].copy_from_slice(&[2, 8, 1, 0]);
         assert_eq!((s.colour_by(), s.palette(), s.saturation(), s.explosions()), (ColourBy::Collisions, Some(7), 0.45, Explosions::Off));
         assert_eq!(FIELDS[PALETTE_FIELD].choices.len(), crate::palette::BITS.len() + 1);
         assert_eq!(Settings::default().wire_colour(), WireColour::Velocity);
@@ -394,7 +441,7 @@ mod tests {
         assert!((s.gravity() - 0.15).abs() < 1e-6, "low gravity is 85% less");
         // a 1.3.0 settings file (no gravity line) still loads
         let old = Settings::from_text("container=Cube\nsolids=5\nwireframe=Off\ntap_speed=Fast\n");
-        assert_eq!(old.pick, [1, 2, 1, 2, 0, 0, 0, 2, 0, 0, 0, 0, 1, 1, 0, 1, 0, 4, 2, 1, 1, 0, 0]);
+        assert_eq!(old.pick, [1, 2, 1, 2, 0, 0, 0, 2, 0, 0, 0, 0, 2, 1, 0, 1, 0, 4, 2, 1, 1, 0, 0, 0, 0]);
         // and a 1.5.0 one with gravity on keeps it on
         assert_eq!(Settings::from_text("gravity=On\n").gravity(), 1.0);
         // and a 1.10 one's glow and explosions "On" read as "Low" and "Weak"
@@ -416,6 +463,19 @@ mod tests {
         all.sort();
         assert_eq!(all, (0..FIELDS.len()).collect::<Vec<_>>());
         assert_eq!(FIELDS[1].choices.len(), physics::MAX_SOLIDS - physics::MIN_SOLIDS + 2);
+        // saturation "Off", the 2-bit palettes, the shader and ambient light
+        assert_eq!(Settings::from_text("saturation=Off\n").saturation(), 0.0);
+        assert_eq!(Settings::from_text("saturation=Low\n").saturation(), 0.45, "older files keep their saturation");
+        assert_eq!((Settings::from_text("palette=2-bit A\n").palette(), Settings::from_text("palette=3-bit A\n").palette()), (Some(0), Some(2)));
+        assert_eq!((d.shader(), d.ambient()), (Shader::Raymarch, false), "raymarch, no ambient light by default");
+        let opt = Settings::from_text("shader=Optimized\nambient=On\n");
+        assert_eq!((opt.shader(), opt.ambient()), (Shader::Optimized, true));
+        let ray = Settings::from_text("ambient=On\n");
+        assert_eq!(ray.ambient(), AMBIENT_WITH_RAYMARCH, "with the raymarch shader only if it was cheap enough");
+        let mut live = d;
+        live.pick[SHADER_FIELD] = 1;
+        live.pick[AMBIENT_FIELD] = 1;
+        assert!(live.same_scene(&d), "shader and ambient light apply live");
         for (i, k) in CONTAINERS.iter().enumerate() {
             assert!(FIELDS[0].choices[i + 1].eq_ignore_ascii_case(k.id()));
         }
@@ -434,7 +494,7 @@ mod tests {
 
     #[test]
     fn text_round_trips_and_tolerates_junk() {
-        let s = Settings { pick: [2, 3, 1, 0, 1, 1, 2, 1, 1, 1, 0, 0, 1, 1, 0, 1, 0, 2, 4, 3, 1, 0, 0] };
+        let s = Settings { pick: [2, 3, 1, 0, 1, 1, 2, 1, 1, 1, 0, 0, 1, 1, 0, 1, 0, 2, 4, 3, 1, 0, 0, 1, 1] };
         assert_eq!(Settings::from_text(&s.to_text()), s);
         let t = Settings::from_text("junk\ncontainer=nope\nsolids = 7\nother=1\n");
         assert_eq!(t.solids(), Some(7));
